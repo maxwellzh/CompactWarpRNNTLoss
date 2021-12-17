@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/local/cuda/include",
+                "/mnt/workspace/zhenghh/miniconda3/envs/cat/include/python3.9",
+                "/mnt/workspace/zhenghh/miniconda3/envs/cat/lib/python3.9/site-packages/torch/include/",
+                "/mnt/workspace/zhenghh/miniconda3/envs/cat/lib/python3.9/site-packages/torch/include/torch/csrc/api/include/",
+                "/mnt/workspace/zhenghh/miniconda3/envs/cat/lib/python3.9/site-packages/torch/include/TH",
+                "/mnt/workspace/zhenghh/miniconda3/envs/cat/lib/python3.9/site-packages/torch/include/THC"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
