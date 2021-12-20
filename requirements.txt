@@ -1,3 +1,6 @@
 pybind11
 torch>=1.7.0
--e git+ssh://github.com/maxwellzh/torch-gather.git@1e47e4d#egg=gather
+# gather
+git+https://github.com/maxwellzh/torch-gather.git@1e47e4d#egg=gather
+# cwarp-rnnt
+.
