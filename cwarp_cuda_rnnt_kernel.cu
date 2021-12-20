@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -7,6 +8,15 @@
 
 #define W 32
 #define logSumExp(a, b) log_sum_exp(static_cast<float>(a), static_cast<float>(b))
+
+void setDim3(dim3 &t, int x = 1, int y = 1, int z = 1)
+{
+    t.x = x;
+    t.y = y;
+    t.z = z;
+
+    return;
+}
 
 // conduct logexpsum in float
 __device__ __forceinline__ float log_sum_exp(float a, float b)
@@ -250,6 +260,19 @@ __global__ void cal_alpha_beta_kernel(
 }
 
 template <typename scalar_t>
+__global__ void cal_beta_(
+    const torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> log_probs,
+    const torch::PackedTensorAccessor32<int, 2, torch::RestrictPtrTraits> labels,
+    const torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> lx,
+    const torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> ly,
+    const torch::PackedTensorAccessor32<int, 1, torch::RestrictPtrTraits> offset,
+    torch::PackedTensorAccessor32<int, 3, torch::RestrictPtrTraits> trace_lock,
+    torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> betas)
+{
+    cal_betas_kernel<scalar_t>(log_probs, labels, lx, ly, offset, trace_lock, betas);
+}
+
+template <typename scalar_t>
 __global__ void fill_grad_blank_kernel(
     const torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> log_probs,
     const torch::PackedTensorAccessor32<int, 2, torch::RestrictPtrTraits> labels,
@@ -371,13 +394,14 @@ cwarp_cuda_costs_with_grad(
     const auto N = lx.size(0);
     const auto T = lx.max().item<int64_t>();      // max of {T_i}
     const auto Up = ly.max().item<int64_t>() + 1; // max of {U_i} + 1
+    auto stream = c10::cuda::getCurrentCUDAStream();
 
     auto alphas = torch::zeros({N, T, Up}, log_probs.options());
     auto betas = torch::zeros_like(alphas);
     auto grads = torch::zeros_like(log_probs);
     auto costs = torch::empty({N}, log_probs.options());
 
-    auto trace_locks = torch::zeros({2, N, Up - 1}, labels.options());
+    auto trace_locks = torch::zeros({2, N, Up}, labels.options());
     unsigned int Wl = 0;
     if (N <= 4)
     {
@@ -396,14 +420,14 @@ cwarp_cuda_costs_with_grad(
         Wl = 16;
     }
 
-    dim3 thread0(W, 2, Wl);
-    dim3 block0((T + W - 1) / W, Up, (N + Wl - 1) / Wl);
+    dim3 blockSize(W, 2, Wl);
+    dim3 gridSize((T + W - 1) / W, Up, (N + Wl - 1) / Wl);
 
     AT_DISPATCH_FLOATING_TYPES(
         log_probs.scalar_type(),
         "rnnt_cwarp_cuda",
         ([&]
-         { cal_alpha_beta_kernel<scalar_t><<<block0, thread0>>>(
+         { cal_alpha_beta_kernel<scalar_t><<<gridSize, blockSize, 0, stream>>>(
                log_probs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
                labels.packed_accessor32<int, 2, torch::RestrictPtrTraits>(),
                lx.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
@@ -416,12 +440,12 @@ cwarp_cuda_costs_with_grad(
     auto err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "alpha/beta calculation error: " + std::string(cudaGetErrorString(err)));
 
-    dim3 block1((T + 1024 - 1) / 1024, Up, N);
+    setDim3(gridSize, (T + 1024 - 1) / 1024, Up, N);
     AT_DISPATCH_FLOATING_TYPES(
         log_probs.scalar_type(),
         "rnnt_fill_grad_blank_cuda",
         ([&]
-         { fill_grad_blank_kernel<scalar_t><<<block1, 1024>>>(
+         { fill_grad_blank_kernel<scalar_t><<<gridSize, 1024, 0, stream>>>(
                log_probs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
                labels.packed_accessor32<int, 2, torch::RestrictPtrTraits>(),
                lx.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
@@ -434,12 +458,12 @@ cwarp_cuda_costs_with_grad(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "fill blank grad error: " + std::string(cudaGetErrorString(err)));
 
-    dim3 block2((T + 1024 - 1) / 1024, Up - 1, N);
+    setDim3(gridSize, (T + 1024 - 1) / 1024, Up - 1, N);
     AT_DISPATCH_FLOATING_TYPES(
         log_probs.scalar_type(),
         "rnnt_fill_grad_label_cuda",
         ([&]
-         { fill_grad_label_kernel<scalar_t><<<block2, 1024>>>(
+         { fill_grad_label_kernel<scalar_t><<<gridSize, 1024, 0, stream>>>(
                log_probs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
                labels.packed_accessor32<int, 2, torch::RestrictPtrTraits>(),
                lx.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
@@ -452,12 +476,12 @@ cwarp_cuda_costs_with_grad(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "fill label grad error: " + std::string(cudaGetErrorString(err)));
 
-    dim3 block3((N + Wl - 1) / Wl);
+    setDim3(gridSize, (N + Wl - 1) / Wl);
     AT_DISPATCH_FLOATING_TYPES(
         log_probs.scalar_type(),
         "rnnt_fill_cost_cuda",
         ([&]
-         { fill_cost_kernel<scalar_t><<<block3, Wl>>>(
+         { fill_cost_kernel<scalar_t><<<gridSize, Wl, 0, stream>>>(
                log_probs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
                lx.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
                ly.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
@@ -494,4 +518,59 @@ torch::Tensor cwarp_cuda_backward_(
     const auto expand_grad_out = torch::repeat_interleave(grad_out, lx * (ly + 1));
     grad_in *= expand_grad_out.view({-1, 1});
     return grad_in;
+}
+
+torch::Tensor cwarp_cuda_cal_costs(
+    const torch::Tensor log_probs,
+    const torch::Tensor labels,
+    const torch::Tensor lx,
+    const torch::Tensor ly,
+    const torch::Tensor offset)
+{
+    const auto N = lx.size(0);
+    const auto T = lx.max().item<int64_t>();      // max of {T_i}
+    const auto Up = ly.max().item<int64_t>() + 1; // max of {U_i} + 1
+    auto stream = c10::cuda::getCurrentCUDAStream();
+
+    auto betas = torch::zeros({N, T, Up}, log_probs.options());
+
+    auto trace_locks = torch::zeros({2, N, Up}, labels.options());
+    unsigned int Wl = 0;
+    if (N <= 4)
+    {
+        Wl = 2;
+    }
+    else if (N <= 8)
+    {
+        Wl = 4;
+    }
+    else if (N <= 16)
+    {
+        Wl = 8;
+    }
+    else
+    {
+        Wl = 16;
+    }
+    dim3 blockSize(W, 1, Wl);
+    dim3 gridSize((T + W - 1) / W, Up, (N + Wl - 1) / Wl);
+
+    AT_DISPATCH_FLOATING_TYPES(
+        log_probs.scalar_type(),
+        "cal_cost_",
+        ([&]
+         { cal_beta_<scalar_t><<<gridSize, blockSize, 0, stream>>>(
+               log_probs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+               labels.packed_accessor32<int, 2, torch::RestrictPtrTraits>(),
+               lx.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
+               ly.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
+               offset.packed_accessor32<int, 1, torch::RestrictPtrTraits>(),
+               trace_locks.packed_accessor32<int, 3, torch::RestrictPtrTraits>(),
+               betas.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>()); }));
+
+    auto err = cudaGetLastError();
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "cal costs w/o grad error: " + std::string(cudaGetErrorString(err)));
+
+    // -betas[:, 0, 0]
+    return -betas.index({"...", 0, 0});
 }

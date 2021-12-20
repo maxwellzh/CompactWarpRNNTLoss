@@ -1,2 +1,3 @@
 pybind11
 torch>=1.7.0
+-e git+ssh://github.com/maxwellzh/torch-gather.git@1e47e4d#egg=gather

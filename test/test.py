@@ -2,6 +2,7 @@ import torch
 import sys
 import cwarp_rnnt._C as core
 import warp_rnnt as base
+import cwarp_rnnt as crnnt
 
 from typing import Union, Tuple
 
@@ -53,11 +54,21 @@ if __name__ == "__main__":
     else:
         SEED = 0
     torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
 
-    xs, lx, ys, ly = generate_data() #4, 128, 512, 128)
+    xs, lx, ys, ly = generate_data()  # 4, 6, 6, 4)
+    print(xs.size())
+    print(ys.size())
+    print("x lens range:", lx.min().item(), lx.max().item())
+    print("y lens range:", ly.min().item(), ly.max().item())
     xs, _ys = compactTensor(xs, ys, lx, ly)
 
     ref_cost = base.rnnt_loss(xs, _ys, lx, ly, gather=True, compact=True)
+    cal_cost = crnnt.transducer_loss(xs, lx, ys, ly, 0, 'none')
+    print((ref_cost - cal_cost) < 1e-3)
+
+    exit(0)
 
     # print("x")
     # print(xs)
@@ -68,9 +79,12 @@ if __name__ == "__main__":
 
     cwarp_cost, grads, alphas, betas = core._cwarp_rnnt_forward(
         xs, lx, ys, ly, 0)
+    cost_wo_grad = core._cwarp_rnnt_loss(xs, lx, ys, ly, 0)
+    print(torch.all((cost_wo_grad - cwarp_cost) < 1e-3))
     print("Forward match: ", torch.all(
-        (ref_cost-cwarp_cost).abs() < max(ref_cost.abs().max(), cwarp_cost.abs().max())).item())
+        (ref_cost-cwarp_cost).abs() / max(ref_cost.abs().max(), cwarp_cost.abs().max()) < 1e-4).item())
 
+    exit(0)
     xs.requires_grad = True
     ref_cost = base.rnnt_loss(xs, _ys, lx, ly, gather=True, compact=True)
     ref_cost.sum().backward()

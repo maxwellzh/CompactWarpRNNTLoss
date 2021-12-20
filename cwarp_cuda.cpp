@@ -36,6 +36,13 @@ torch::Tensor cwarp_cuda_backward_(
     const torch::Tensor lx,
     const torch::Tensor ly);
 
+torch::Tensor cwarp_cuda_cal_costs(
+    const torch::Tensor log_probs,
+    const torch::Tensor labels,
+    const torch::Tensor lx,
+    const torch::Tensor ly,
+    const torch::Tensor offset);
+
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_TYPE(x, T) TORCH_CHECK(x.scalar_type() == T, #x " must be " #T)
@@ -48,6 +55,32 @@ torch::Tensor cwarp_cuda_backward_(
 #define Slice torch::indexing::Slice
 
 // C++ interface
+torch::Tensor
+compact_rnnt_loss(
+    const torch::Tensor xs,
+    const torch::Tensor lx,
+    const torch::Tensor ys,
+    const torch::Tensor ly,
+    const int blank)
+{
+    CHECK_CONTIGUOUS(xs);
+    CHECK_CUDA(xs);
+    CHECK_INPUT(lx, torch::ScalarType::Int);
+    CHECK_INPUT(ys, torch::ScalarType::Int);
+    CHECK_INPUT(ly, torch::ScalarType::Int);
+
+    auto offset = torch::zeros_like(lx);
+    {
+        auto cumsum = torch::cumsum((lx * (ly + 1)), /*dim=*/0);
+        // offset[1:] = cumsum[:-1]
+        offset.index_put_({Slice(1, None, None)}, cumsum.index({Slice(0, -1, None)}));
+    }
+
+    auto gathered_xs = gather_cuda_forward(xs, lx, ys, ly, offset, blank);
+
+    return cwarp_cuda_cal_costs(gathered_xs, ys, lx, ly, offset);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 compact_rnnt_loss_forward(
     const torch::Tensor xs,
@@ -112,4 +145,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         "_cwarp_rnnt_backward",
         &compact_rnnt_loss_backward_,
         "CUDA-Warp Transducer loss backward for compact layout.");
+
+    m.def(
+        "_cwarp_rnnt_loss",
+        &compact_rnnt_loss,
+        "CUDA_Warp Transducer loss calculation w/o gradients.");
 }
